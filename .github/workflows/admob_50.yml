@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       days_back:
-        description: 'Days to sync (default: 2)'
+        description: 'Days to sync (default: 3)'
         required: false
-        default: '2'
+        default: '3'
       backfill_start:
         description: 'Backfill start date (YYYY-MM-DD)'
         required: false
@@ -16,10 +16,14 @@ on:
         description: 'Backfill end date (YYYY-MM-DD)'
         required: false
 
+concurrency:
+  group: admob-sync-account-3
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,7 +50,6 @@ jobs:
           BQ_DATASET_ID:         ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION:           ${{ secrets.BQ_LOCATION }}
           ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          # Account 3 OAuth (NEW SECRETS for Account 3 repo)
           ADMOB_PUBLISHER_ID:    ${{ secrets.ADMOB_PUBLISHER_ID_ACCOUNT3 }}
           OAUTH_CLIENT_ID:       ${{ secrets.OAUTH_CLIENT_ID_ACCOUNT3 }}
           OAUTH_CLIENT_SECRET:   ${{ secrets.OAUTH_CLIENT_SECRET_ACCOUNT3 }}
@@ -58,5 +61,5 @@ jobs:
               --backfill-end "${{ github.event.inputs.backfill_end }}"
           else
             python src/admob_python.py \
-              --days "${{ github.event.inputs.days_back || '2' }}"
+              --days "${{ github.event.inputs.days_back || '3' }}"
           fi
