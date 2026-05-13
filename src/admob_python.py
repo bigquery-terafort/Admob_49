@@ -1,10 +1,11 @@
 """
-AdMob → BigQuery  (ACCOUNT 2)
+AdMob → BigQuery  (ACCOUNT 3)
 =====================================================
 Identical to v3 FINAL but with:
 - publisher_id column added to all writes
-- Publisher-scoped DELETE (won't wipe account 1 or 3 data)
-- Uses ACCOUNT 2's OAuth credentials via env vars
+- Publisher-scoped DELETE (won't wipe account 1 or 2 data)
+- Auto-migrates existing tables (ADD COLUMN IF NOT EXISTS) for missing schema columns
+- Uses ACCOUNT 3's OAuth credentials via env vars
 """
 
 import os
@@ -21,6 +22,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 from google.oauth2 import service_account
 
 socket.setdefaulttimeout(180)
@@ -293,18 +295,56 @@ def ensure_dataset(bq: bigquery.Client):
     try:
         bq.get_dataset(ds_id)
         print(f"  Dataset exists: {ds_id}")
-    except Exception:
+    except NotFound:
         ds = bigquery.Dataset(ds_id)
         ds.location = BQ_LOCATION
         bq.create_dataset(ds)
         print(f"  Created dataset: {ds_id}")
+
+def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
+    """
+    Ensure existing table has all expected columns.
+    ALTER TABLE ADD COLUMN IF NOT EXISTS for any missing columns.
+    Auto-fixes schema drift between accounts using shared tables.
+    """
+    tid = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+    try:
+        table = bq.get_table(tid)
+    except NotFound:
+        return  # Table doesn't exist — will be created fresh
+
+    existing_columns = {f.name for f in table.schema}
+
+    for field in expected_schema:
+        if field.name in existing_columns:
+            continue
+
+        # REPEATED and RECORD columns can't be added via simple ALTER TABLE
+        if field.mode == "REPEATED" or field.field_type == "RECORD":
+            print(
+                f"  ⚠️  Cannot auto-migrate {table_name}.{field.name} "
+                f"({field.field_type}/{field.mode}) — needs manual ALTER"
+            )
+            continue
+
+        alter_sql = (
+            f"ALTER TABLE `{tid}` "
+            f"ADD COLUMN IF NOT EXISTS {field.name} {field.field_type}"
+        )
+        try:
+            bq.query(alter_sql).result()
+            print(f"  Migrated {table_name}: added {field.name} ({field.field_type})")
+        except Exception as e:
+            print(f"  ⚠️  Migration failed for {table_name}.{field.name}: {e}")
 
 def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
     tid = f"{PROJECT_ID}.{DATASET_ID}.{name}"
     try:
         bq.get_table(tid)
         print(f"  Table exists: {name}")
-    except Exception:
+        # Auto-migrate any missing columns (fixes schema drift across accounts)
+        migrate_table_schema(bq, name, schema)
+    except NotFound:
         t = bigquery.Table(tid, schema=schema)
         if is_fact:
             t.time_partitioning = bigquery.TimePartitioning(
@@ -334,7 +374,7 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
 
 def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: str,
                                 start: date, end: date):
-    """Delete ONLY this publisher's rows. Won't touch account 1 or 3 data."""
+    """Delete ONLY this publisher's rows. Won't touch account 1 or 2 data."""
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
     bq.query(
         f"""
@@ -732,7 +772,7 @@ def sync(days_back: int = 3):
     end_date     = datetime.utcnow().date() - timedelta(days=1)
     start_date   = end_date - timedelta(days=days_back - 1)
 
-    print(f"\n=== AdMob Sync Account 2 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob Sync Account 3 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -776,7 +816,7 @@ def backfill(start_str: str, end_str: str):
     start_date   = datetime.strptime(start_str, "%Y-%m-%d").date()
     end_date     = datetime.strptime(end_str,   "%Y-%m-%d").date()
 
-    print(f"\n=== AdMob Backfill Account 2 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob Backfill Account 3 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -826,7 +866,7 @@ def backfill(start_str: str, end_str: str):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery sync (Account 2)")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery sync (Account 3)")
     p.add_argument("--days",           type=int, default=3)
     p.add_argument("--backfill-start", type=str)
     p.add_argument("--backfill-end",   type=str)
