@@ -1,11 +1,37 @@
 """
-AdMob → BigQuery  (ACCOUNT 3)
-=====================================================
-Identical to v3 FINAL but with:
-- publisher_id column added to all writes
-- Publisher-scoped DELETE (won't wipe account 1 or 2 data)
-- Auto-migrates existing tables (ADD COLUMN IF NOT EXISTS) for missing schema columns
-- Uses ACCOUNT 3's OAuth credentials via env vars
+AdMob → BigQuery  (PRODUCTION v4) — pub-4905254875899379
+==========================================================
+THIS REPO HANDLES: pub-4905254875899379
+
+VERSION HISTORY:
+  v3 FINAL: Original (no publisher_id, wiped other accounts' data)
+  v4:       Production-grade unified template
+            ✅ publisher_id in all schemas + rows
+            ✅ Publisher-scoped DELETEs (won't touch other accounts)
+            ✅ Auto schema migration (ALTER TABLE ADD COLUMN IF NOT EXISTS)
+            ✅ DELETE retry wrapper + schema verification
+            ✅ Hard fail if publisher_id env var is missing
+            ✅ Wait for schema cache after migrations
+            ✅ Specific NotFound exception (not bare except)
+
+REQUIRED ENV VARS:
+   ADMOB_PUBLISHER_ID    = pub-4905254875899379   (or accounts/pub-4905254875899379)
+   GCP_PROJECT_ID        = terafort
+   BQ_DATASET_ID         = Admob (default)
+   BQ_LOCATION           = US (default)
+   OAUTH_CLIENT_ID       = <OAuth client for pub-4905's AdMob account>
+   OAUTH_CLIENT_SECRET   = <OAuth secret>
+   OAUTH_REFRESH_TOKEN   = <Refresh token specific to pub-4905>
+   GCP_CREDENTIALS_JSON  = <Service account JSON>
+
+USAGE:
+   python admob_sync_v4.py --days 3
+   python admob_sync_v4.py --backfill-start 2026-04-30 --backfill-end 2026-05-19
+
+DATA MODEL:
+   Money fields: INT64 MICROS — divide by 1,000,000 for USD
+   Partition  : report_date (DAY)
+   Cluster    : data_source, app_id, country_code, ad_format
 """
 
 import os
@@ -51,12 +77,16 @@ MAX_RETRIES    = 4
 RETRY_BACKOFF  = 8
 ROW_LIMIT_WARN = 90000
 
+# App batch sizes per report type — proven safe vs 100K limit
 BATCH_NETWORK         = 5
 BATCH_NETWORK_ADTYPE  = 3
 BATCH_MEDIATION       = 2
 
+# Pause after ALTER TABLE to let BQ metadata cache refresh
+SCHEMA_CACHE_WAIT_SEC = 3
+
 # =============================================================================
-# SCHEMAS
+# SCHEMAS — publisher_id added to all tables that need attribution
 # =============================================================================
 
 UNIFIED_FACT_SCHEMA = [
@@ -154,7 +184,14 @@ def validate_config() -> bool:
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        print(f"ERROR: Missing env vars: {', '.join(missing)}")
+        print(f"❌ ERROR: Missing env vars: {', '.join(missing)}")
+        return False
+
+    # Extra strictness — publisher_id must look like a real AdMob publisher
+    pid = normalize_publisher_id(ADMOB_PUBLISHER_ID)
+    if not pid.startswith("pub-") or len(pid) < 10:
+        print(f"❌ ERROR: ADMOB_PUBLISHER_ID looks invalid: '{pid}'")
+        print(f"   Expected format: pub-XXXXXXXXXXXXXXXX")
         return False
     return True
 
@@ -303,9 +340,9 @@ def ensure_dataset(bq: bigquery.Client):
 
 def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
     """
-    Ensure existing table has all expected columns.
+    Auto-add missing columns to existing table.
     ALTER TABLE ADD COLUMN IF NOT EXISTS for any missing columns.
-    Auto-fixes schema drift between accounts using shared tables.
+    Fixes schema drift between accounts using shared tables.
     """
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
     try:
@@ -314,12 +351,13 @@ def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
         return  # Table doesn't exist — will be created fresh
 
     existing_columns = {f.name for f in table.schema}
+    migrations_run = 0
 
     for field in expected_schema:
         if field.name in existing_columns:
             continue
 
-        # REPEATED and RECORD columns can't be added via simple ALTER TABLE
+        # REPEATED and RECORD columns can't be added via simple ALTER
         if field.mode == "REPEATED" or field.field_type == "RECORD":
             print(
                 f"  ⚠️  Cannot auto-migrate {table_name}.{field.name} "
@@ -334,15 +372,22 @@ def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
         try:
             bq.query(alter_sql).result()
             print(f"  Migrated {table_name}: added {field.name} ({field.field_type})")
+            migrations_run += 1
         except Exception as e:
             print(f"  ⚠️  Migration failed for {table_name}.{field.name}: {e}")
+
+    # Wait for BQ metadata cache to refresh after schema changes
+    if migrations_run > 0:
+        print(f"  ⏱️  Waiting {SCHEMA_CACHE_WAIT_SEC}s for {table_name} schema cache to refresh …")
+        time.sleep(SCHEMA_CACHE_WAIT_SEC)
+        # Force refresh by re-fetching
+        bq.get_table(tid)
 
 def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
     tid = f"{PROJECT_ID}.{DATASET_ID}.{name}"
     try:
         bq.get_table(tid)
         print(f"  Table exists: {name}")
-        # Auto-migrate any missing columns (fixes schema drift across accounts)
         migrate_table_schema(bq, name, schema)
     except NotFound:
         t = bigquery.Table(tid, schema=schema)
@@ -372,28 +417,79 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
     print(f"  Loaded {n:,} rows → {table}")
     return n
 
+def _verify_publisher_id_column(bq: bigquery.Client, table: str) -> bool:
+    """
+    Defensive check: confirm publisher_id column exists in table.
+    Guards against BigQuery metadata cache staleness right after migrations.
+    Returns True if column exists, False otherwise.
+    """
+    tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+    try:
+        table_ref = bq.get_table(tid)
+        column_names = {f.name for f in table_ref.schema}
+        if 'publisher_id' not in column_names:
+            print(f"  ⚠️  {table} missing publisher_id column in cached schema")
+            return False
+        return True
+    except NotFound:
+        print(f"  ⚠️  {table} not found")
+        return False
+    except Exception as e:
+        print(f"  ⚠️  Could not verify {table} schema: {e}")
+        return True  # Proceed anyway — don't block on transient errors
+
 def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: str,
                                 start: date, end: date):
-    """Delete ONLY this publisher's rows. Won't touch account 1 or 2 data."""
+    """
+    Delete ONLY this publisher's fact rows for the given date range.
+    Publisher-scoped — will NOT touch other accounts' data.
+    Retries on transient BQ errors.
+    Verifies publisher_id column exists first.
+    """
+    if not publisher_id:
+        raise ValueError("delete_range_for_publisher: publisher_id is required (empty)")
+
+    if not _verify_publisher_id_column(bq, table):
+        print(f"  ⚠️  Skipping DELETE for {table} — publisher_id column missing")
+        return
+
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
-    bq.query(
-        f"""
-        DELETE FROM `{tid}`
-        WHERE report_date BETWEEN '{start}' AND '{end}'
-          AND publisher_id = '{publisher_id}'
-        """
-    ).result()
+
+    def _do_delete():
+        return bq.query(
+            f"""
+            DELETE FROM `{tid}`
+            WHERE report_date BETWEEN '{start}' AND '{end}'
+              AND publisher_id = '{publisher_id}'
+            """
+        ).result()
+
+    with_retry(_do_delete, label=f"delete_range_{table}")
     print(f"  Deleted {table} for {publisher_id}: {start} → {end}")
 
 def delete_dim_for_publisher(bq: bigquery.Client, table: str, publisher_id: str):
-    """Delete ONLY this publisher's dim rows."""
+    """
+    Delete ONLY this publisher's dim rows.
+    Publisher-scoped, retry-wrapped, schema-verified.
+    """
+    if not publisher_id:
+        raise ValueError("delete_dim_for_publisher: publisher_id is required (empty)")
+
+    if not _verify_publisher_id_column(bq, table):
+        print(f"  ⚠️  Skipping dim DELETE for {table} — publisher_id column missing")
+        return
+
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
-    bq.query(
-        f"""
-        DELETE FROM `{tid}`
-        WHERE publisher_id = '{publisher_id}'
-        """
-    ).result()
+
+    def _do_delete():
+        return bq.query(
+            f"""
+            DELETE FROM `{tid}`
+            WHERE publisher_id = '{publisher_id}'
+            """
+        ).result()
+
+    with_retry(_do_delete, label=f"delete_dim_{table}")
     print(f"  Deleted dim {table} for {publisher_id}")
 
 def write_log(bq, run_id, publisher_id, run_type, start, end, status, totals, error, duration):
@@ -425,12 +521,16 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
     ts = utc_now()
 
     acc = with_retry(lambda: v1.accounts().get(name=account).execute())
-    bq.query(
-        f"""
-        DELETE FROM `{PROJECT_ID}.{DATASET_ID}.{DIM_ACCOUNT}`
-        WHERE publisher_id = '{publisher_id}'
-        """
-    ).result()
+
+    # Account dim — publisher-scoped delete then append
+    if _verify_publisher_id_column(bq, DIM_ACCOUNT):
+        with_retry(lambda: bq.query(
+            f"""
+            DELETE FROM `{PROJECT_ID}.{DATASET_ID}.{DIM_ACCOUNT}`
+            WHERE publisher_id = '{publisher_id}'
+            """
+        ).result(), label="delete_account_dim")
+
     load_rows(bq, DIM_ACCOUNT, ACCOUNT_SCHEMA, [{
         "account_resource_name": acc.get("name"),
         "publisher_id":          publisher_id,
@@ -439,6 +539,7 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
         "sync_timestamp":        ts,
     }])
 
+    # Apps dim
     delete_dim_for_publisher(bq, DIM_APPS, publisher_id)
     apps = paginate(
         lambda pageToken=None: v1.accounts().apps().list(parent=account, pageToken=pageToken),
@@ -465,6 +566,7 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
         })
     load_rows(bq, DIM_APPS, APPS_SCHEMA, app_rows)
 
+    # Ad units dim
     delete_dim_for_publisher(bq, DIM_AD_UNITS, publisher_id)
     units = paginate(
         lambda pageToken=None: v1.accounts().adUnits().list(parent=account, pageToken=pageToken),
@@ -694,18 +796,22 @@ def fetch_batched(v1, account, app_ids, start, end, run_id, publisher_id,
     return all_rows
 
 # =============================================================================
-# ACCOUNT
+# ACCOUNT RESOLUTION
 # =============================================================================
 
 def get_account_name(v1) -> str:
-    if ADMOB_PUBLISHER_ID:
-        raw = ADMOB_PUBLISHER_ID.strip()
-        return raw if raw.startswith("accounts/") else f"accounts/{raw}"
-    resp = with_retry(lambda: v1.accounts().list().execute())
-    accounts = resp.get("account", []) or resp.get("accounts", [])
-    if not accounts:
-        raise ValueError("No AdMob accounts found.")
-    return accounts[0]["name"]
+    """
+    Resolve AdMob account resource name.
+    HARD FAILS if ADMOB_PUBLISHER_ID env var is empty — won't fall back to
+    accounts[0] like the old script (which could pick the wrong account).
+    """
+    if not ADMOB_PUBLISHER_ID:
+        raise ValueError(
+            "ADMOB_PUBLISHER_ID env var is required. "
+            "Refusing to auto-pick from accounts.list() to prevent wrong account."
+        )
+    raw = ADMOB_PUBLISHER_ID.strip()
+    return raw if raw.startswith("accounts/") else f"accounts/{raw}"
 
 # =============================================================================
 # TABLES
@@ -772,7 +878,7 @@ def sync(days_back: int = 3):
     end_date     = datetime.utcnow().date() - timedelta(days=1)
     start_date   = end_date - timedelta(days=days_back - 1)
 
-    print(f"\n=== AdMob Sync Account 3 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob Sync v4 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -816,7 +922,7 @@ def backfill(start_str: str, end_str: str):
     start_date   = datetime.strptime(start_str, "%Y-%m-%d").date()
     end_date     = datetime.strptime(end_str,   "%Y-%m-%d").date()
 
-    print(f"\n=== AdMob Backfill Account 3 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob Backfill v4 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -866,10 +972,11 @@ def backfill(start_str: str, end_str: str):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery sync (Account 3)")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v4")
     p.add_argument("--days",           type=int, default=3)
     p.add_argument("--backfill-start", type=str)
     p.add_argument("--backfill-end",   type=str)
+    # Kept for backwards compatibility with existing GitHub Actions YAML
     p.add_argument("--chunk",          type=int, default=1)
     p.add_argument("--chunk-days",     type=int, default=1)
     p.add_argument("--enable-campaign", action="store_true")
